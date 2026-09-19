@@ -316,6 +316,7 @@ function loadFonts(){
 loadFonts();
 
 let syncedFlags = {};
+let pushSubscription = null;
 let applyingRemoteUpdate = false;
 
 function showToast(msg){
@@ -354,6 +355,7 @@ async function loadAppData(){
         folders = d.folders || [];
         stats = d.stats || stats;
         syncedFlags = d.syncedFlags || {};
+        pushSubscription = d.pushSubscription || null;
       }
       const needsSave = defaultSeedIfNeeded(hadData);
       if(needsSave) await saveAll();
@@ -367,6 +369,7 @@ async function loadAppData(){
         folders = d.folders || [];
         stats = d.stats || stats;
         syncedFlags = d.syncedFlags || {};
+        pushSubscription = d.pushSubscription || null;
         render();
         applyingRemoteUpdate = false;
       });
@@ -390,6 +393,7 @@ async function loadAppData(){
       folders = parsed.folders || [];
       stats = parsed.stats || stats;
       syncedFlags = parsed.syncedFlags || {};
+      pushSubscription = parsed.pushSubscription || null;
       hadData = true;
     }catch(e){ /* corrupt data, fall through to defaults */ }
   }
@@ -402,7 +406,7 @@ async function loadAppData(){
 // otherwise falls back to localStorage (this device only).
 async function saveAll(){
   if(applyingRemoteUpdate) return; // avoid re-saving data we just received from another device
-  const payload = {tasks, folders, stats, syncedFlags};
+  const payload = {tasks, folders, stats, syncedFlags, pushSubscription};
   if(FIREBASE_ENABLED){
     try{
       await setDoc(doc(db, 'pace', 'appdata'), payload);
@@ -710,11 +714,47 @@ async function deleteTask(){
   render();
 }
 
-function enableNotifs(){
+const VAPID_PUBLIC_KEY = "BBS-NBvXETo4YN8_eTL8l6XyHv84crYV-NS3pnkhhOf59tsaDnkbK07t70a_BW0DQe_vJsV7KxXVcYc1ygJKwbY";
+
+function urlBase64ToUint8Array(base64String){
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
+
+async function enableNotifs(){
   if(!('Notification' in window)){ alert('Notifications not supported in this browser.'); return; }
-  Notification.requestPermission().then(p=>{
-    document.getElementById('notifbtn').textContent = p==='granted' ? 'notifications on' : 'enable notifications';
-  });
+  const perm = await Notification.requestPermission();
+  document.getElementById('notifbtn').textContent = perm==='granted' ? 'notifications on' : 'enable notifications';
+  if(perm !== 'granted') return;
+
+  if(!('serviceWorker' in navigator) || !('PushManager' in window)){
+    showToast('⚠ Background push isn\'t supported in this browser — reminders will only fire while the app tab is open.');
+    return;
+  }
+  try{
+    const reg = await navigator.serviceWorker.register('sw.js');
+    let sub = await reg.pushManager.getSubscription();
+    if(!sub){
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
+      });
+    }
+    pushSubscription = sub.toJSON();
+    await saveAll();
+    showToast('✓ Background reminders enabled — you\'ll get notified even with the app closed.');
+  }catch(e){
+    console.error('Push subscription failed', e);
+    showToast('⚠ Could not set up background notifications: ' + (e.message || e));
+  }
+}
+
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('sw.js').catch(e=>console.warn('SW pre-register failed', e));
 }
 setInterval(()=>{
   if(!('Notification' in window) || Notification.permission!=='granted') return;
