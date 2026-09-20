@@ -1,0 +1,90 @@
+name: Check Automation Health
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify workflows are registered and running
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const problems = [];
+
+            const { data: wf } = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            for (const required of ["Send Reminders", "Sync to Firestore"]) {
+              const found = wf.workflows.find(w => w.name === required);
+              if (!found) {
+                problems.push(`"${required}" is not a registered workflow at all — it was probably created in the wrong folder (check it's at the repo root, not nested inside another folder).`);
+              } else if (found.state !== "active") {
+                problems.push(`"${required}" exists but is not active (state: ${found.state}).`);
+              }
+            }
+
+            const sendReminders = wf.workflows.find(w => w.name === "Send Reminders");
+            if (sendReminders) {
+              const { data: runs } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: sendReminders.id,
+                per_page: 1,
+              });
+              if (runs.workflow_runs.length === 0) {
+                problems.push(`"Send Reminders" has never run.`);
+              } else {
+                const last = new Date(runs.workflow_runs[0].created_at);
+                const ageMinutes = (Date.now() - last.getTime()) / 60000;
+                if (ageMinutes > 90) {
+                  problems.push(`"Send Reminders" last ran ${Math.round(ageMinutes)} minutes ago (should be every 15). GitHub Actions cron may have been disabled — check the Actions tab.`);
+                }
+              }
+            }
+
+            const title = "⚠️ Pace automation check failed";
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: "automation-health",
+            });
+
+            if (problems.length > 0) {
+              const body = "The daily automation health check found:\n\n" + problems.map(p => `- ${p}`).join("\n") +
+                "\n\nThis issue was opened automatically. Fix the problem, then close this issue — it will reopen automatically tomorrow if it's still broken.";
+              if (existing.length === 0) {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title,
+                  body,
+                  labels: ["automation-health"],
+                });
+              }
+            } else {
+              for (const issue of existing) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: "closed",
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: "All checks passed today — closing.",
+                });
+              }
+            }
