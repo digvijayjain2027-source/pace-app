@@ -55,7 +55,7 @@ async function main() {
     let addedCount = 0;
     newItems.forEach(item => {
       const idSource = (item.title || "") + (item.date || "");
-      const id = "gmailsync_" + Buffer.from(idSource, "utf8").toString("base64").slice(0, 16).replace(/[^a-zA-Z0-9]/g, "");
+      const id = "gmailsync_" + require("crypto").createHash("sha256").update(idSource, "utf8").digest("hex").slice(0, 20);
       if (!current.tasks.find(t => t.id === id)) {
         current.tasks.push({
           id,
