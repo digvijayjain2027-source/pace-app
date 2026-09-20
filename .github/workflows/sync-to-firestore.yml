@@ -1,0 +1,30 @@
+name: Sync to Firestore
+on:
+  push:
+    paths:
+      - 'sync-queue/**.json'
+    branches:
+      - main
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run sync
+        run: node scripts/sync-to-firestore.js
+      - name: Commit cleanup of processed queue files
+        run: |
+          git config user.name "pace-sync-bot"
+          git config user.email "actions@github.com"
+          git add -A sync-queue
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Clear processed sync-queue files [skip ci]"
+            git push
+          fi
