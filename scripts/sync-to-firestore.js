@@ -1,14 +1,22 @@
 // Pace sync processor — run inside GitHub Actions.
-// Reads any queued JSON files in sync-queue/, merges their newItems into
-// the Firestore document at pace/appdata, then lets the workflow delete
-// the processed files so they aren't reprocessed next run.
+//
+// Reads any queued JSON files in sync-queue/, and atomically APPENDS their
+// newItems onto the Firestore document at pace/appdata's `tasks` array —
+// it never overwrites the whole document. This matters: the app itself
+// also reads-and-rewrites the whole document on every change, and a plain
+// overwrite here could silently race with that and erase whatever the app
+// just saved (this happened for real — see backfill-2026-09-20b.json).
+// Firestore's `appendMissingElements` transform is applied server-side
+// against whatever the document looks like at that instant, so it can't
+// be clobbered by a concurrent write the way a full overwrite can.
 
 const fs = require("fs");
 const path = require("path");
 
 const FIREBASE_PROJECT_ID = "on-track-4c880";
-const FIRESTORE_DOC_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/pace/appdata`;
-
+const DOC_PATH = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/pace/appdata`;
+const FIRESTORE_DOC_URL = `https://firestore.googleapis.com/v1/${DOC_PATH}`;
+const FIRESTORE_COMMIT_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`;
 const QUEUE_DIR = path.join(process.cwd(), "sync-queue");
 
 async function main() {
@@ -28,9 +36,7 @@ async function main() {
     const full = path.join(QUEUE_DIR, file);
     try {
       const parsed = JSON.parse(fs.readFileSync(full, "utf8"));
-      if (Array.isArray(parsed.newItems)) {
-        newItems = newItems.concat(parsed.newItems);
-      }
+      if (Array.isArray(parsed.newItems)) newItems = newItems.concat(parsed.newItems);
     } catch (e) {
       console.error(`Failed to parse ${file}:`, e.message);
     }
@@ -39,25 +45,31 @@ async function main() {
   if (newItems.length === 0) {
     console.log("Queued files had no items — nothing to sync.");
   } else {
-    console.log(`Syncing ${newItems.length} item(s) to Firestore...`);
-
+    // Read current tasks only to dedupe by id — a stale read here is safe,
+    // because the actual write below is an atomic append, not an overwrite.
     const getResp = await fetch(FIRESTORE_DOC_URL);
-    let current = { tasks: [], folders: [], stats: { xp: 0, level: 1, streak: 0, lastCompletionDate: null }, syncedFlags: {} };
+    let existingIds = new Set();
     if (getResp.ok) {
       const doc = await getResp.json();
-      current = fromFirestoreFields(doc.fields || {});
+      const tasksField =
+        (doc.fields && doc.fields.tasks && doc.fields.tasks.arrayValue && doc.fields.tasks.arrayValue.values) || [];
+      tasksField.forEach(v => {
+        const idVal = v.mapValue && v.mapValue.fields && v.mapValue.fields.id && v.mapValue.fields.id.stringValue;
+        if (idVal) existingIds.add(idVal);
+      });
+    } else {
+      console.error(
+        `Warning: could not read current document (status ${getResp.status}) — id dedupe list may be incomplete, but the atomic append below is still safe from data loss.`
+      );
     }
-    if (!current.tasks) current.tasks = [];
-    if (!current.folders) current.folders = [];
-    if (!current.stats) current.stats = { xp: 0, level: 1, streak: 0, lastCompletionDate: null };
-    if (!current.syncedFlags) current.syncedFlags = {};
 
-    let addedCount = 0;
+    const toAdd = [];
     newItems.forEach(item => {
       const idSource = (item.title || "") + (item.date || "");
-      const id = "gmailsync_" + require("crypto").createHash("sha256").update(idSource, "utf8").digest("hex").slice(0, 20);
-      if (!current.tasks.find(t => t.id === id)) {
-        current.tasks.push({
+      const id =
+        "gmailsync_" + require("crypto").createHash("sha256").update(idSource, "utf8").digest("hex").slice(0, 20);
+      if (!existingIds.has(id)) {
+        toAdd.push({
           id,
           title: item.title || "Untitled",
           folder: item.folder || "inbox",
@@ -69,23 +81,38 @@ async function main() {
           done: false,
           notified: false
         });
-        addedCount++;
+        existingIds.add(id);
       }
     });
 
-    const fields = toFirestoreFields(current);
-    const patchResp = await fetch(FIRESTORE_DOC_URL, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fields })
-    });
-
-    if (!patchResp.ok) {
-      const errText = await patchResp.text();
-      throw new Error(`Firestore PATCH failed: ${errText}`);
+    if (toAdd.length === 0) {
+      console.log("All queued items already exist in Firestore — nothing new to append.");
+    } else {
+      const commitResp = await fetch(FIRESTORE_COMMIT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          writes: [
+            {
+              transform: {
+                document: DOC_PATH,
+                fieldTransforms: [
+                  {
+                    fieldPath: "tasks",
+                    appendMissingElements: { values: toAdd.map(toFirestoreValue) }
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      });
+      if (!commitResp.ok) {
+        const errText = await commitResp.text();
+        throw new Error(`Firestore atomic append failed: ${errText}`);
+      }
+      console.log(`Done. Appended ${toAdd.length} new task(s) atomically.`);
     }
-
-    console.log(`Done. Added ${addedCount} new task(s). Total tasks now: ${current.tasks.length}.`);
   }
 
   // Remove processed queue files so the next run doesn't resend them.
@@ -100,7 +127,7 @@ main().catch(err => {
   process.exit(1);
 });
 
-// ── Generic JS <-> Firestore REST typed-value converters ──────────────────
+// ── Generic JS -> Firestore REST typed-value converter ─────────────────────
 
 function toFirestoreValue(v) {
   if (v === null || v === undefined) return { nullValue: null };
@@ -118,23 +145,4 @@ function toFirestoreFields(obj) {
     fields[key] = toFirestoreValue(obj[key]);
   }
   return fields;
-}
-
-function fromFirestoreValue(v) {
-  if (v.nullValue !== undefined) return null;
-  if (v.booleanValue !== undefined) return v.booleanValue;
-  if (v.integerValue !== undefined) return parseInt(v.integerValue, 10);
-  if (v.doubleValue !== undefined) return v.doubleValue;
-  if (v.stringValue !== undefined) return v.stringValue;
-  if (v.arrayValue !== undefined) return (v.arrayValue.values || []).map(fromFirestoreValue);
-  if (v.mapValue !== undefined) return fromFirestoreFields(v.mapValue.fields || {});
-  return null;
-}
-
-function fromFirestoreFields(fields) {
-  const obj = {};
-  for (const key of Object.keys(fields)) {
-    obj[key] = fromFirestoreValue(fields[key]);
-  }
-  return obj;
 }
